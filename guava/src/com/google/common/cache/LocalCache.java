@@ -168,6 +168,32 @@ final class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<
   // TODO(fry): empirically optimize this
   static final int DRAIN_MAX = 16;
 
+  /**
+   * The outcome of an explicit weight-aware value update through {@link #replaceWeighted}.
+   *
+   * <p>The user-supplied {@link Weigher} is always invoked <i>outside</i> of the segment lock, so a
+   * reentrant cache query made from within it cannot deadlock. The old entry is left completely
+   * untouched unless the new weight was successfully computed and the same generation is still
+   * committed under the segment lock.
+   */
+  enum WeightedUpdateResult {
+    /** The new value was weighed, validated, and actually committed. */
+    COMMITTED,
+
+    /**
+     * No live entry existed for the key (it was absent, still loading, collected, or expired), so
+     * nothing was changed.
+     */
+    ABSENT,
+
+    /**
+     * The entry that was weighed outside the lock no longer holds the same value generation when
+     * the lock was acquired (it was concurrently replaced, removed, or expired), so nothing was
+     * changed.
+     */
+    REJECTED
+  }
+
   // Fields
 
   static final Logger logger = Logger.getLogger(LocalCache.class.getName());
@@ -2871,6 +2897,99 @@ final class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<
       }
     }
 
+    /**
+     * Explicitly replaces the value associated with {@code key} by {@code newValue}, recomputing
+     * the weight for this update instead of carrying over the weight of the previous value.
+     *
+     * <p>The user {@link Weigher} is deliberately invoked <b>outside</b> this segment's lock, so a
+     * weigher that reentrantly queries the cache (including this same key or even this same
+     * segment) can never deadlock against the update. The old entry and its weight are retained
+     * whenever the weigher throws or reports a negative weight; validation failures are signaled by
+     * {@link IllegalStateException}, thrown to the caller before any state is touched.
+     *
+     * <p>The replacement notification ({@link RemovalCause#REPLACED}) is enqueued only after the
+     * new value reference has actually been committed, and it is delivered to listeners without the
+     * segment lock held (via {@link #postWriteCleanup}). An entry whose weight alone exceeds the
+     * segment capacity is removed with {@link RemovalCause#SIZE} -- which is kept separate from the
+     * {@link RemovalCause#REPLACED} notification for the value it superseded.
+     */
+    WeightedUpdateResult replaceWeighted(K key, int hash, V newValue) {
+      checkNotNull(key);
+      checkNotNull(newValue);
+
+      // Phase 1: locate the live generation and run the user's weigher with no segment lock held.
+      // A reentrant cache.get(...) (of any key, on any segment) inside the weigher is safe.
+      long now = map.ticker.read();
+      ReferenceEntry<K, V> weighedEntry = getLiveEntry(key, hash, now);
+      if (weighedEntry == null) {
+        return WeightedUpdateResult.ABSENT;
+      }
+      ValueReference<K, V> weighedValueReference = weighedEntry.getValueReference();
+      V previousValue = weighedValueReference.get();
+      if (previousValue == null || weighedValueReference.isLoading()) {
+        return WeightedUpdateResult.ABSENT;
+      }
+
+      // User code: never invoked while holding the segment lock. On failure (exception or a
+      // negative weight) nothing is mutated and the previous value/weight remain in effect.
+      int newWeight = map.weigher.weigh(key, newValue);
+      checkState(newWeight >= 0, "Weights must be non-negative");
+
+      // Phase 2: re-validate under the lock that the same value generation is still committed.
+      // This generation check prevents an entry that was concurrently replaced, removed, or
+      // expired (i.e. an older expiration generation) from being overwritten by a stale update.
+      lock();
+      try {
+        now = map.ticker.read();
+        preWriteCleanup(now);
+
+        AtomicReferenceArray<ReferenceEntry<K, V>> table = this.table;
+        int index = hash & (table.length() - 1);
+        ReferenceEntry<K, V> first = table.get(index);
+
+        for (ReferenceEntry<K, V> e = first; e != null; e = e.getNext()) {
+          K entryKey = e.getKey();
+          if (e.getHash() == hash
+              && entryKey != null
+              && map.keyEquivalence.equivalent(key, entryKey)) {
+            ValueReference<K, V> currentValueReference = e.getValueReference();
+
+            // Same generation still committed? Value references are replaced on every mutation, so
+            // identity is an exact generation token; also recheck expiration and liveness.
+            if (currentValueReference != weighedValueReference
+                || currentValueReference.get() != previousValue
+                || currentValueReference.isLoading()
+                || map.isExpired(e, now)) {
+              return WeightedUpdateResult.REJECTED;
+            }
+
+            // Commit: install the freshly weighed value first, and only then retire the old
+            // generation. This makes the REPLACED notification correspond to a real commit and
+            // keeps totalWeight accounting exact (old weight removed, new weight added).
+            ++modCount;
+            ValueReference<K, V> newReference =
+                map.valueStrength.referenceValue(this, e, newValue, newWeight);
+            e.setValueReference(newReference);
+            recordWrite(e, newWeight, now);
+            enqueueNotification(
+                key, hash, previousValue, currentValueReference.getWeight(), RemovalCause.REPLACED);
+            currentValueReference.notifyNewValue(newValue);
+
+            // If the freshly committed entry alone is over capacity, only it is evicted, with
+            // RemovalCause.SIZE (distinct from the REPLACED cause above).
+            evictEntries(e);
+            return WeightedUpdateResult.COMMITTED;
+          }
+        }
+        return WeightedUpdateResult.REJECTED;
+      } finally {
+        unlock();
+        // Delivers any pending notifications (including REPLACED and SIZE above) to listeners
+        // only after the commit and without the segment lock held.
+        postWriteCleanup();
+      }
+    }
+
     /** Expands the table if possible. */
     @GuardedBy("this")
     void expand() {
@@ -4210,6 +4329,23 @@ final class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<
     return segmentFor(hash).put(key, hash, value, true);
   }
 
+  /**
+   * Explicit weight-aware update entry point. Replaces the value of an existing entry, having the
+   * configured {@link Weigher} recompute the weight for the new value (the previous weighing
+   * result is never reused). See {@link WeightedUpdateResult} for the possible outcomes.
+   *
+   * <p>Ordinary {@link #put} remains unchanged and fully supported; this method additionally
+   * guarantees that the weigher runs outside the segment lock, that a failed weighing leaves the
+   * old value and weight intact, and that the replacement is rejected if the weighed generation was
+   * concurrently superseded (including expiration).
+   */
+  WeightedUpdateResult replaceWeighted(K key, V newValue) {
+    checkNotNull(key);
+    checkNotNull(newValue);
+    int hash = hash(key);
+    return segmentFor(hash).replaceWeighted(key, hash, newValue);
+  }
+
   @Override
   public @Nullable V compute(
       K key, BiFunction<? super K, ? super @Nullable V, ? extends @Nullable V> function) {
@@ -4866,6 +5002,16 @@ final class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<
     @Override
     public void put(K key, V value) {
       localCache.put(key, value);
+    }
+
+    /**
+     * Explicit weight-aware update entry point: recomputes the weight for {@code value} against
+     * the currently committed generation of {@code key}, without reusing the old weigher result.
+     * Package-private so that the cache's own tests can exercise the strict update contract while
+     * the public {@link #put} API keeps its ordinary, compatible behavior.
+     */
+    WeightedUpdateResult replaceWeighted(K key, V value) {
+      return localCache.replaceWeighted(key, value);
     }
 
     @Override
